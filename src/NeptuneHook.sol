@@ -1,14 +1,13 @@
 // SPDX-License-Identifier: UNLICENSED
 // TODO: Decide on license
-pragma solidity ^0.8.25;
+pragma solidity ^0.8.26;
 
 import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
-import {BaseHook} from "v4-periphery/BaseHook.sol";
+import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
-import {CurrencySettleTake} from "v4-core/libraries/CurrencySettleTake.sol"; // TODO: Use test/utils/CurrencySettler.sol instead?
+import {CurrencySettler} from "v4-core/../test/utils/CurrencySettler.sol"; // TODO: Is this the right library to use?
 import {Hooks} from "v4-core/libraries/Hooks.sol";
-import {LiquidityAmounts} from "v4-periphery/libraries/LiquidityAmounts.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
@@ -16,6 +15,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 // TODO: Move to its own file
@@ -31,11 +31,13 @@ interface IStrategy {
  * @author Charm Finance
  * @notice A Uniswap V4 hook that auctions off right to dynamically set and receive all swap fees
  * @dev This code is a proof-of-concept and must not be used in production
+ *
+ * TODO: Extend IHooks instead of BaseHook?
  */
 contract NeptuneHook is BaseHook {
     // TODO: Clean up unused libraries
     using CurrencyLibrary for Currency;
-    using CurrencySettleTake for Currency;
+    using CurrencySettler for Currency;
     using LPFeeLibrary for uint24;
     using PoolIdLibrary for PoolKey;
     using SafeCast for int256;
@@ -50,6 +52,7 @@ contract NeptuneHook is BaseHook {
 
     /// @notice State stored for each pool.
     struct PoolState {
+        address strategist;
         IStrategy strategy; // Current attached strategy contract. Zero address if none attached.
         address feeRecipient; // Fee recipient specified by strategist
         uint256 rent;
@@ -72,7 +75,7 @@ contract NeptuneHook is BaseHook {
 
     // Swap fee used when no strategy set
     // TODO: Think of a better way than having the same fee across all pools
-    uint128 DEFAULT_SWAP_FEE = 3000; // 30 bps swap fee
+    uint24 DEFAULT_SWAP_FEE = 3000; // 30 bps swap fee
 
     uint256 MIN_USURP_FACTOR = 1.2e18; // 1.2x rent increase to usurp
     uint256 COOLDOWN_BLOCKS = 100; // Cannot decrease bid for 100 blocks after newly becoming manager
@@ -86,9 +89,9 @@ contract NeptuneHook is BaseHook {
         return Hooks.Permissions({
             beforeInitialize: true,
             afterInitialize: false,
-            beforeAddLiquidity: false,
+            beforeAddLiquidity: true,
             beforeRemoveLiquidity: false,
-            afterAddLiquidity: true,
+            afterAddLiquidity: false,
             afterRemoveLiquidity: false,
             beforeSwap: true,
             afterSwap: false,
@@ -101,12 +104,12 @@ contract NeptuneHook is BaseHook {
         });
     }
 
-    /// @notice Ensure dynamic fee flag is set and the given `hookData` is valid and set up initial
-    /// pool state.
-    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata hookData)
+    /// @notice Ensure dynamic fee flag is set.
+    function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
         external
+        view
         override
-        poolManagerOnly
+        onlyByPoolManager
         returns (bytes4)
     {
         // Pool must have dynamic fee flag set. This is so we can override the LP fee in `beforeSwap`.
@@ -122,14 +125,15 @@ contract NeptuneHook is BaseHook {
         return this.beforeInitialize.selector;
     }
 
-    function beforeAddLiquidity(address, PoolKey calldata key, uint256, uint256, bytes calldata)
-        external
-        override
-        poolManagerOnly
-        returns (bytes4)
-    {
+    function beforeAddLiquidity(
+        address,
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) external override onlyByPoolManager returns (bytes4) {
         // Distribute unpaid rent to LPs
         _pokeRent(key);
+        return this.beforeAddLiquidity.selector;
     }
 
     /// @notice Call strategy to calculate swap fees and redirect the fees to the strategist.
@@ -137,7 +141,7 @@ contract NeptuneHook is BaseHook {
     function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         override
-        poolManagerOnly
+        onlyByPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         // Distribute unpaid rent to LPs
@@ -145,14 +149,14 @@ contract NeptuneHook is BaseHook {
 
         // If no strategy is set, LPs get the default fee like in a hookless Uniswap pool
         PoolState storage pool = pools[key.toId()];
-        if (pool.strategy == address(0)) {
+        if (address(pool.strategy) == address(0)) {
             return
                 (this.beforeSwap.selector, toBeforeSwapDelta(0, 0), DEFAULT_SWAP_FEE | LPFeeLibrary.OVERRIDE_FEE_FLAG);
         }
 
         // Call strategy contract to get swap fee.
         // TODO: Implement.
-        uint128 fee = strategy.calculateSwapFee(key, params);
+        uint128 fee = pool.strategy.calculateSwapFee(key, params);
 
         // Calculate swap fees. The fees don't go to LPs, they instead go to the `feeRecipient` specified by the strategist.
         int256 fees = params.amountSpecified * uint256(fee).toInt256() / 1e6;
@@ -166,7 +170,7 @@ contract NeptuneHook is BaseHook {
 
         // Send fees to `feeRecipient`
         // TODO: Support both claim and erc20 transfer?
-        feeCurrency.take(poolManager, feeRecipient, absFees.toUint256(), true);
+        take(feeCurrency, poolManager, pool.feeRecipient, absFees.toUint256(), true);
 
         // Override LP fee to zero
         return (this.beforeSwap.selector, toBeforeSwapDelta(absFees.toInt128(), 0), LPFeeLibrary.OVERRIDE_FEE_FLAG);
@@ -176,7 +180,6 @@ contract NeptuneHook is BaseHook {
     /// as the manager.
     // TODO: Emit event
     function depositCollateral(PoolKey calldata key, uint256 amount) external {
-        PoolState storage pool = pools[key.toId()];
         collateral[key.toId()][msg.sender] += amount;
 
         // Receive tokens from user
@@ -219,8 +222,9 @@ contract NeptuneHook is BaseHook {
         // Distribute unpaid rent to LPs
         _pokeRent(key);
 
-        PoolState storage pool = pools[key.toId()];
-        if (msg.sender != pool.manager) revert SenderMustBeStrategist();
+        PoolId poolId = key.toId();
+        PoolState storage pool = pools[poolId];
+        if (msg.sender != pool.strategist) revert SenderMustBeStrategist();
         if (rent < pool.rent && block.number <= pool.lastUsurpBlock + COOLDOWN_BLOCKS) {
             revert RentTooLowDuringCooldown();
         }
@@ -240,8 +244,9 @@ contract NeptuneHook is BaseHook {
         // Distribute unpaid rent to LPs
         _pokeRent(key);
 
-        PoolState storage pool = pools[key.toId()];
-        if (msg.sender == pool.manager) revert SenderIsAlreadyStrategist();
+        PoolId poolId = key.toId();
+        PoolState storage pool = pools[poolId];
+        if (msg.sender == pool.strategist) revert SenderIsAlreadyStrategist();
         if (rent < pool.rent * MIN_USURP_FACTOR / 1 ether) revert RentTooLow();
 
         uint256 minCollateral = rent * MIN_COLLATERAL_BLOCKS;
@@ -249,8 +254,8 @@ contract NeptuneHook is BaseHook {
             revert NotEnoughCollateral();
         }
 
-        lastUsurpBlock = block.number;
-        pool.strategy = strategy;
+        pool.lastUsurpBlock = block.number;
+        pool.strategy = IStrategy(strategy);
         pool.feeRecipient = feeRecipient;
         pool.rent = rent;
     }
@@ -261,12 +266,14 @@ contract NeptuneHook is BaseHook {
         pool.lastRentPaidBlock = block.number;
 
         // TODO: Fix after deciding which token to pay rent in
-        poolManager.unlock(abi.encode(CallbackData(key, pool.manager, 0, rentAmount)));
+        poolManager.unlock(abi.encode(CallbackData(key, pool.strategist, 0, rentAmount)));
     }
 
     // TODO: Emit event
-    function unlockCallback(bytes calldata rawData) external override poolManagerOnly returns (bytes memory) {
+    // TODO: Check don't need onlyByPoolManager modifier
+    function _unlockCallback(bytes calldata rawData) internal override returns (bytes memory) {
         // Take rent amount from this contract
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
         _settleOrTake(data.key, address(this), -data.donateAmount0.toInt256(), -data.donateAmount1.toInt256(), false);
 
         // Deduct from strategist's collateral
@@ -274,15 +281,53 @@ contract NeptuneHook is BaseHook {
         collateral[data.key.toId()][data.sender] -= data.donateAmount0;
 
         // Distribute to in-range LPs
-        CallbackData memory data = abi.decode(rawData, (CallbackData));
         poolManager.donate(data.key, data.donateAmount0, data.donateAmount1, "");
+
+        // TODO: Return something?
+        return "";
     }
 
     /// @notice Calls `settle` or `take` depending on the signs of `delta0` and `delta1`
     function _settleOrTake(PoolKey memory key, address user, int256 delta0, int256 delta1, bool useClaims) internal {
-        if (delta0 < 0) key.currency0.settle(poolManager, user, uint256(-delta0), useClaims);
-        if (delta1 < 0) key.currency1.settle(poolManager, user, uint256(-delta1), useClaims);
-        if (delta0 > 0) key.currency0.take(poolManager, user, uint256(delta0), useClaims);
-        if (delta1 > 0) key.currency1.take(poolManager, user, uint256(delta1), useClaims);
+        if (delta0 < 0) settle(key.currency0, poolManager, user, uint256(-delta0), useClaims);
+        if (delta1 < 0) settle(key.currency1, poolManager, user, uint256(-delta1), useClaims);
+        if (delta0 > 0) take(key.currency0, poolManager, user, uint256(delta0), useClaims);
+        if (delta1 > 0) take(key.currency1, poolManager, user, uint256(delta1), useClaims);
+    }
+
+    /// @notice Settle (pay) a currency to the PoolManager
+    /// @dev From https://github.com/Uniswap/v4-core/blob/main/test/utils/CurrencySettler.sol
+    /// @param currency Currency to settle
+    /// @param manager IPoolManager to settle to
+    /// @param payer Address of the payer, the token sender
+    /// @param amount Amount to send
+    /// @param burn If true, burn the ERC-6909 token, otherwise ERC20-transfer to the PoolManager
+    function settle(Currency currency, IPoolManager manager, address payer, uint256 amount, bool burn) internal {
+        // for native currencies or burns, calling sync is not required
+        // short circuit for ERC-6909 burns to support ERC-6909-wrapped native tokens
+        if (burn) {
+            manager.burn(payer, currency.toId(), amount);
+        } else if (currency.isNative()) {
+            manager.settle{value: amount}();
+        } else {
+            manager.sync(currency);
+            if (payer != address(this)) {
+                IERC20Minimal(Currency.unwrap(currency)).transferFrom(payer, address(manager), amount);
+            } else {
+                IERC20Minimal(Currency.unwrap(currency)).transfer(address(manager), amount);
+            }
+            manager.settle();
+        }
+    }
+
+    /// @notice Take (receive) a currency from the PoolManager
+    /// @dev From https://github.com/Uniswap/v4-core/blob/main/test/utils/CurrencySettler.sol
+    /// @param currency Currency to take
+    /// @param manager IPoolManager to take from
+    /// @param recipient Address of the recipient, the token receiver
+    /// @param amount Amount to receive
+    /// @param claims If true, mint the ERC-6909 token, otherwise ERC20-transfer from the PoolManager to recipient
+    function take(Currency currency, IPoolManager manager, address recipient, uint256 amount, bool claims) internal {
+        claims ? manager.mint(recipient, currency.toId(), amount) : manager.take(currency, recipient, amount);
     }
 }

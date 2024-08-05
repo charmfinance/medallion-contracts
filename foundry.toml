@@ -3,4 +3,12 @@ src = "src"
 out = "out"
 libs = ["lib"]
 
-# See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+# Set in order to use transient storage
+solc_version = "0.8.26"
+evm_version = "cancun"
+optimizer_runs = 800
+via_ir = false
+ffi = true
+
+# Temporary fix for "multiple matching artifacts found" error
+unchecked_cheatcode_artifacts = true
