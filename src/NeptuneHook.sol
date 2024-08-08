@@ -53,19 +53,20 @@ contract NeptuneHook is BaseHook {
     /// @notice State stored for each pool.
     struct PoolState {
         address strategist;
-        IStrategy strategy; // Current attached strategy contract. Zero address if none attached.
+        address strategy; // Current attached strategy contract. Zero address if none attached.
         address feeRecipient; // Fee recipient specified by strategist
         uint256 rent;
         uint256 lastRentPaidBlock;
         uint256 lastUsurpBlock;
+        bool rentInTokenZero; // TODO: Find better way
     }
 
     /// @notice Data passed to `PoolManager.unlock` when distributing rent to LPs.
     struct CallbackData {
         PoolKey key;
         address sender;
-        uint256 donateAmount0;
-        uint256 donateAmount1;
+        uint256 depositAmount;
+        uint256 withdrawAmount;
     }
 
     mapping(PoolId => PoolState) public pools;
@@ -132,7 +133,7 @@ contract NeptuneHook is BaseHook {
         bytes calldata
     ) external override onlyByPoolManager returns (bytes4) {
         // Distribute unpaid rent to LPs
-        _pokeRent(key);
+        _payRent(key);
         return this.beforeAddLiquidity.selector;
     }
 
@@ -145,7 +146,7 @@ contract NeptuneHook is BaseHook {
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         // Distribute unpaid rent to LPs
-        _pokeRent(key);
+        _payRent(key);
 
         // If no strategy is set, LPs get the default fee like in a hookless Uniswap pool
         PoolState storage pool = pools[key.toId()];
@@ -156,7 +157,7 @@ contract NeptuneHook is BaseHook {
 
         // Call strategy contract to get swap fee.
         // TODO: Implement.
-        uint128 fee = pool.strategy.calculateSwapFee(key, params);
+        uint128 fee = IStrategy(pool.strategy).calculateSwapFee(key, params);
 
         // Calculate swap fees. The fees don't go to LPs, they instead go to the `feeRecipient` specified by the strategist.
         int256 fees = params.amountSpecified * uint256(fee).toInt256() / 1e6;
@@ -180,20 +181,15 @@ contract NeptuneHook is BaseHook {
     /// as the manager.
     // TODO: Emit event
     function depositCollateral(PoolKey calldata key, uint256 amount) external {
-        collateral[key.toId()][msg.sender] += amount;
+        // Deposit 6909 claim tokens to Uniswap V4 PoolManager
+        poolManager.unlock(abi.encode(CallbackData(key, msg.sender, amount, 0)));
 
-        // Receive tokens from user
-        // TODO: Figure out a way to determine currency
-        Currency currency = key.currency0;
-        IERC20(Currency.unwrap(currency)).transferFrom(msg.sender, address(this), amount);
+        collateral[key.toId()][msg.sender] += amount;
     }
 
     /// @notice Withdraw tokens from this contract that were previously deposited with `deposit`.
     // TODO: Emit event
     function withdrawCollateral(PoolKey calldata key, uint256 amount) external {
-        // Distribute unpaid rent to LPs
-        _pokeRent(key);
-
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
 
@@ -208,83 +204,87 @@ contract NeptuneHook is BaseHook {
 
         collateral[poolId][msg.sender] -= amount;
 
-        // Send tokens to user
-        // TODO: Figure out a way to determine currency
-        Currency currency = key.currency0;
-        IERC20(Currency.unwrap(currency)).transfer(msg.sender, amount);
+        // Withdraw 6909 claim tokens from Uniswap V4 PoolManager
+        poolManager.unlock(abi.encode(CallbackData(key, msg.sender, 0, amount)));
     }
 
-    /// @notice Modify the rent if already the strategist.
-    /// @param key The pool to bid in
-    /// @param rent The amount of tokens to pay per block to LPs. The token is determined by `payInTokenZero`
+    /// @notice Modify bid or usurp the current strategist of a pool by paying a higher rent
+    // TODO: Figure out a way to avoid gas wars when multiple managers want to usurp when rent is low
     // TODO: Emit event
-    function modifyBid(PoolKey calldata key, uint256 rent) external {
+    function modifyBid(PoolKey calldata key, address strategy, address feeRecipient, uint256 rent) external {
         // Distribute unpaid rent to LPs
-        _pokeRent(key);
+        poolManager.unlock(abi.encode(CallbackData(key, msg.sender, 0, 0)));
 
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
-        if (msg.sender != pool.strategist) revert SenderMustBeStrategist();
-        if (rent < pool.rent && block.number <= pool.lastUsurpBlock + COOLDOWN_BLOCKS) {
+
+        uint256 minCollateral = rent * MIN_COLLATERAL_BLOCKS;
+        if (collateral[poolId][msg.sender] < minCollateral) {
+            revert NotEnoughCollateral();
+        }
+
+        // Bid is too low so can't modify
+        if (msg.sender == pool.strategist && rent < pool.rent && block.number <= pool.lastUsurpBlock + COOLDOWN_BLOCKS)
+        {
             revert RentTooLowDuringCooldown();
         }
 
-        uint256 minCollateral = rent * MIN_COLLATERAL_BLOCKS;
-        if (collateral[poolId][msg.sender] < minCollateral) {
-            revert NotEnoughCollateral();
+        // Bid is too low so can't usurp
+        if (msg.sender != pool.strategist && rent < pool.rent * MIN_USURP_FACTOR / 1 ether) {
+            revert RentTooLow();
         }
 
-        pool.rent = rent;
-    }
-
-    /// @notice Usurp the current strategist of a pool by paying a higher rent
-    // TODO: Figure out a way to avoid gas wars when multiple managers want to usurp when rent is low
-    // TODO: Emit event
-    function usurp(PoolKey calldata key, address strategy, address feeRecipient, uint256 rent) external {
-        // Distribute unpaid rent to LPs
-        _pokeRent(key);
-
-        PoolId poolId = key.toId();
-        PoolState storage pool = pools[poolId];
-        if (msg.sender == pool.strategist) revert SenderIsAlreadyStrategist();
-        if (rent < pool.rent * MIN_USURP_FACTOR / 1 ether) revert RentTooLow();
-
-        uint256 minCollateral = rent * MIN_COLLATERAL_BLOCKS;
-        if (collateral[poolId][msg.sender] < minCollateral) {
-            revert NotEnoughCollateral();
+        // Update state
+        if (msg.sender != pool.strategist) {
+            pool.lastUsurpBlock = block.number;
         }
-
-        pool.lastUsurpBlock = block.number;
-        pool.strategy = IStrategy(strategy);
+        pool.strategist = msg.sender;
+        pool.strategy = strategy;
         pool.feeRecipient = feeRecipient;
         pool.rent = rent;
     }
 
-    function _pokeRent(PoolKey calldata key) internal {
-        PoolState storage pool = pools[key.toId()];
-        uint256 rentAmount = pool.rent * (block.number - pool.lastRentPaidBlock);
-        pool.lastRentPaidBlock = block.number;
+    // TODO: Check don't need onlyByPoolManager modifier
+    function _unlockCallback(bytes calldata rawData) internal override returns (bytes memory) {
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
 
-        // TODO: Fix after deciding which token to pay rent in
-        poolManager.unlock(abi.encode(CallbackData(key, pool.strategist, 0, rentAmount)));
+        if (data.depositAmount > 0) {
+            PoolId poolId = data.key.toId();
+            PoolState storage pool = pools[poolId];
+            Currency currency = pool.rentInTokenZero ? data.key.currency0 : data.key.currency1;
+            take(currency, poolManager, address(this), data.depositAmount, true); // Mint 6909
+            settle(currency, poolManager, data.sender, data.depositAmount, false); // Transfer ERC20
+        }
+        if (data.withdrawAmount > 0) {
+            PoolId poolId = data.key.toId();
+            PoolState storage pool = pools[poolId];
+            Currency currency = pool.rentInTokenZero ? data.key.currency0 : data.key.currency1;
+            settle(currency, poolManager, address(this), data.withdrawAmount, true); // Burn 6909
+            take(currency, poolManager, data.sender, data.withdrawAmount, false); // Claim ERC20
+        }
+
+        _payRent(data.key);
+        return "";
     }
 
     // TODO: Emit event
-    // TODO: Check don't need onlyByPoolManager modifier
-    function _unlockCallback(bytes calldata rawData) internal override returns (bytes memory) {
-        // Take rent amount from this contract
-        CallbackData memory data = abi.decode(rawData, (CallbackData));
-        _settleOrTake(data.key, address(this), -data.donateAmount0.toInt256(), -data.donateAmount1.toInt256(), false);
+    function _payRent(PoolKey memory key) internal {
+        PoolState storage pool = pools[key.toId()];
+        uint256 rentAmount = pool.rent * (block.number - pool.lastRentPaidBlock);
+        pool.lastRentPaidBlock = block.number;
+        if (rentAmount == 0) return;
+
+        uint256 amount0 = pool.rentInTokenZero ? rentAmount : 0;
+        uint256 amount1 = pool.rentInTokenZero ? 0 : rentAmount;
+
+        _settleOrTake(key, address(this), -amount0.toInt256(), -amount1.toInt256(), true);
 
         // Deduct from strategist's collateral
-        // TODO: Figure out a way to determine currency
-        collateral[data.key.toId()][data.sender] -= data.donateAmount0;
+        collateral[key.toId()][pool.strategist] -= amount0;
 
         // Distribute to in-range LPs
-        poolManager.donate(data.key, data.donateAmount0, data.donateAmount1, "");
-
-        // TODO: Return something?
-        return "";
+        // TODO: ensure there is liquidity when donating
+        poolManager.donate(key, amount0, amount1, "");
     }
 
     /// @notice Calls `settle` or `take` depending on the signs of `delta0` and `delta1`
