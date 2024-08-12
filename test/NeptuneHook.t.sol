@@ -13,19 +13,25 @@ import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {FixedFeeStrategy} from "../src/strategies/FixedFeeStrategy.sol";
 
-contract NeptuneHookTest is Test, Deployers {
+/**
+ * TODO: Add test for swap when no strategy attached
+ */
+contract TestNeptuneHook is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
+    using SafeCast for int256;
 
     // Addresses for pranking
-    address constant ALICE = address(0x1000);
-    address constant BOB = address(0x1001);
+    address constant ALICE = address(0x1001);
+    address constant BOB = address(0x1002);
 
     int24 constant TICK_SPACING = 60;
 
@@ -252,20 +258,85 @@ contract NeptuneHookTest is Test, Deployers {
         assertEq(manager.balanceOf(address(hook), currency.toId()), 0);
     }
 
-    // TODO: Fix this test
     function test_modifyBid_rentIsCharged() public {
         // Deposit enough collateral to cover the bid
         vm.prank(ALICE);
         hook.depositCollateral(key, 100 ether);
 
+        // Params for lp router
+        // TODO: Remove
+        // IPoolManager.ModifyLiquidityParams public LIQUIDITY_PARAMS =
+        //     IPoolManager.ModifyLiquidityParams({tickLower: -120, tickUpper: 120, liquidityDelta: 1e18, salt: 0});
+        // IPoolManager.ModifyLiquidityParams public REMOVE_LIQUIDITY_PARAMS =
+        //     IPoolManager.ModifyLiquidityParams({tickLower: -120, tickUpper: 120, liquidityDelta: -1e18, salt: 0});
+
+        uint256 balance0 = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+        uint256 balance1 = IERC20(Currency.unwrap(currency1)).balanceOf(address(this));
+        modifyLiquidityRouter.modifyLiquidity(key, LIQUIDITY_PARAMS, ZERO_BYTES);
+
         // Bid and become strategist
         vm.prank(ALICE);
-        hook.modifyBid(key, address(0), address(0), 1000);
+        hook.modifyBid(key, address(0), address(0), 1e12);
 
         // Skip time forwards by 120 blocks
         vm.roll(block.number + 120);
 
+        uint256 expectedRent = 120 * 1e12;
+        uint256 depositBefore = hook.getDeposit(key, ALICE);
+        uint256 claimBalanceBefore = manager.balanceOf(address(hook), currency1.toId()); // TODO: make currency choice depend on `payInTokenZero`
+
         // Poke
-        hook.modifyBid(key, address(0), address(0), 1000);
+        vm.prank(ALICE);
+        hook.modifyBid(key, address(0), address(0), 1e12);
+
+        // Check rent was charged from Alice and from hook's claim balance
+        assertEq(hook.getDeposit(key, ALICE), depositBefore - expectedRent);
+        assertEq(manager.balanceOf(address(hook), currency1.toId()), claimBalanceBefore - expectedRent);
+
+        // Check LP was paid in currency1
+        // TODO: make currency choice depend on `payInTokenZero`
+        modifyLiquidityRouter.modifyLiquidity(key, REMOVE_LIQUIDITY_PARAMS, ZERO_BYTES);
+        assertApproxEqAbs(IERC20(Currency.unwrap(currency0)).balanceOf(address(this)), balance0, 5);
+        assertGt(IERC20(Currency.unwrap(currency1)).balanceOf(address(this)), balance1 + 1000);
+    }
+
+    function test_beforeSwap() public {
+        // Deposit enough collateral to cover the bid
+        vm.prank(ALICE);
+        hook.depositCollateral(key, 100 ether);
+
+        // Deploy fixed 1% fee strategy
+        FixedFeeStrategy strategy = new FixedFeeStrategy(10000);
+
+        // Bid and become strategist
+        vm.prank(ALICE);
+        hook.modifyBid(key, address(strategy), address(0), 1000);
+
+        BalanceDelta delta = _swap(key, true, 0.000_001 ether);
+        int128 loss = 1e18 + delta.amount1() * 1e18 / delta.amount0();
+
+        // Check loss is 1%
+        assertApproxEqRel(int256(loss).toUint256(), 0.01e18, 0.01e18);
+    }
+
+    /// @notice Helper method to do a swap without a slippage limit
+    function _swap(PoolKey memory key_, bool zeroForOne, int256 amountSpecified)
+        internal
+        returns (BalanceDelta delta)
+    {
+        PoolSwapTest.TestSettings memory settings =
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false});
+
+        uint160 sqrtPriceLimitX96 = zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1;
+        delta = swapRouter.swap(
+            key_,
+            IPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: amountSpecified,
+                sqrtPriceLimitX96: sqrtPriceLimitX96
+            }),
+            settings,
+            ZERO_BYTES
+        );
     }
 }

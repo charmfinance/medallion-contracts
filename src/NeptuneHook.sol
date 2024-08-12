@@ -17,14 +17,7 @@ import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Minimal} from "v4-core/interfaces/external/IERC20Minimal.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
-
-// TODO: Move to its own file
-// TODO: Add example strategies
-interface IStrategy {
-    function calculateSwapFee(PoolKey calldata key, IPoolManager.SwapParams calldata params)
-        external
-        returns (uint128);
-}
+import {IStrategy} from "./interfaces/IStrategy.sol";
 
 /**
  * @title Neptune Hook
@@ -33,6 +26,7 @@ interface IStrategy {
  * @dev This code is a proof-of-concept and must not be used in production
  *
  * TODO: Extend IHooks instead of BaseHook?
+ * TODO: Implement `liquidate` function to liquidate managers
  */
 contract NeptuneHook is BaseHook {
     // TODO: Clean up unused libraries
@@ -280,7 +274,7 @@ contract NeptuneHook is BaseHook {
         _settleOrTake(key, address(this), -amount0.toInt256(), -amount1.toInt256(), true);
 
         // Deduct from strategist's collateral
-        collateral[key.toId()][pool.strategist] -= amount0;
+        collateral[key.toId()][pool.strategist] -= rentAmount;
 
         // Distribute to in-range LPs
         // TODO: ensure there is liquidity when donating
@@ -329,5 +323,9 @@ contract NeptuneHook is BaseHook {
     /// @param claims If true, mint the ERC-6909 token, otherwise ERC20-transfer from the PoolManager to recipient
     function take(Currency currency, IPoolManager manager, address recipient, uint256 amount, bool claims) internal {
         claims ? manager.mint(recipient, currency.toId(), amount) : manager.take(currency, recipient, amount);
+    }
+
+    function getDeposit(PoolKey calldata key, address user) external view returns (uint256) {
+        return collateral[key.toId()][user];
     }
 }
