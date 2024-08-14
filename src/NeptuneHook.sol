@@ -189,7 +189,7 @@ contract NeptuneHook is BaseHook {
 
         // Get user's up-to-date balance
         uint256 collateral_ = collateral[poolId][msg.sender];
-        uint256 minCollateral = pool.rent * MIN_COLLATERAL_BLOCKS;
+        uint256 minCollateral = msg.sender == pool.strategist ? pool.rent * MIN_COLLATERAL_BLOCKS : 0;
 
         // Check user has enough balance to withdraw
         if (collateral_ < amount + minCollateral) {
