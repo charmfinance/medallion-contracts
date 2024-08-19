@@ -300,6 +300,52 @@ contract TestNeptuneHook is Test, Deployers {
         assertGt(IERC20(Currency.unwrap(currency1)).balanceOf(address(this)), balance1 + 1000);
     }
 
+    function test_modifyBid_bidTooHigh() public {
+        // Deposit collateral
+        vm.prank(ALICE);
+        hook.depositCollateral(key, 100 ether);
+
+        // Deploy fixed 1% fee strategy
+        FixedFeeStrategy strategy = new FixedFeeStrategy(10000);
+
+        // Bid and become strategist. Collateral can cover 10 blocks.
+        vm.prank(ALICE);
+        vm.expectRevert(abi.encodeWithSelector(NeptuneHook.NotEnoughCollateral.selector));
+        hook.modifyBid(key, address(strategy), address(0), 100 ether / 10);
+    }
+
+    function test_modifyBid_automaticallyLiquidateIfOutOfCollateral() public {
+        // Deposit collateral
+        vm.prank(ALICE);
+        hook.depositCollateral(key, 100 ether);
+
+        // Deploy fixed 1% fee strategy
+        FixedFeeStrategy strategy = new FixedFeeStrategy(10000);
+
+        // Bid and become strategist. Collateral can cover 100 blocks.
+        vm.prank(ALICE);
+        hook.modifyBid(key, address(strategy), address(0), 100 ether / 100);
+
+        // Skip time forwards by 200 blocks
+        vm.roll(block.number + 200);
+
+        // Do small swap so that rent is paid
+        _swap(key, true, 0.000_001 ether);
+
+        // Check pool state. Not enough collateral so strategist should have been automatically liquidated
+        address strategist;
+        address strategy_;
+        address feeRecipient;
+        uint256 rent;
+        uint256 lastUsurpBlock;
+        (strategist, strategy_, feeRecipient, rent,, lastUsurpBlock,) = hook.pools(key.toId());
+        assertEq(strategist, address(0));
+        assertEq(strategy_, address(0));
+        assertEq(feeRecipient, address(0));
+        assertEq(rent, 0);
+        assertEq(lastUsurpBlock, block.number);
+    }
+
     function test_beforeSwap() public {
         // Deposit enough collateral to cover the bid
         vm.prank(ALICE);
@@ -312,6 +358,7 @@ contract TestNeptuneHook is Test, Deployers {
         vm.prank(ALICE);
         hook.modifyBid(key, address(strategy), address(0), 1000);
 
+        // Do small swap
         BalanceDelta delta = _swap(key, true, 0.000_001 ether);
         int128 loss = 1e18 + delta.amount1() * 1e18 / delta.amount0();
 
@@ -327,7 +374,7 @@ contract TestNeptuneHook is Test, Deployers {
         // Deploy fixed 1% fee strategy
         FixedFeeStrategy strategy = new FixedFeeStrategy(10000);
 
-        // Bid and become strategist. Bid enough to cover 100 blocks
+        // Bid and become strategist. Collateral can cover 100 blocks.
         vm.prank(ALICE);
         hook.modifyBid(key, address(strategy), address(0), 100 ether / 100);
 

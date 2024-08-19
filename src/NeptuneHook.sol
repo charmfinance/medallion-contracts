@@ -267,6 +267,12 @@ contract NeptuneHook is BaseHook {
         pool.lastRentPaidBlock = block.number;
         if (rentAmount == 0) return;
 
+        uint256 strategistCollateral = collateral[key.toId()][pool.strategist];
+        bool isLiquidate = strategistCollateral < rentAmount;
+        if (isLiquidate) {
+            rentAmount = strategistCollateral;
+        }
+
         uint256 amount0 = pool.rentInTokenZero ? rentAmount : 0;
         uint256 amount1 = pool.rentInTokenZero ? 0 : rentAmount;
 
@@ -278,6 +284,12 @@ contract NeptuneHook is BaseHook {
         // Distribute to in-range LPs
         // TODO: ensure there is liquidity when donating
         poolManager.donate(key, amount0, amount1, "");
+
+        // If strategist doesn't have enough collateral to pay rent and wasn't liquidated
+        // in time, remove them as strategist
+        if (isLiquidate) {
+            _resetStrategist(key);
+        }
     }
 
     /// @notice Calls `settle` or `take` depending on the signs of `delta0` and `delta1`
@@ -338,7 +350,11 @@ contract NeptuneHook is BaseHook {
         if (collateral[key.toId()][pool.strategist] > pool.rent * LIQUIDATION_BLOCKS) {
             revert NotLiquidatable();
         }
+        _resetStrategist(key);
+    }
 
+    function _resetStrategist(PoolKey memory key) internal {
+        PoolState storage pool = pools[key.toId()];
         pool.strategist = address(0);
         pool.strategy = address(0);
         pool.feeRecipient = address(0);
