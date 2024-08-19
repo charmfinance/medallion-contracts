@@ -319,6 +319,39 @@ contract TestNeptuneHook is Test, Deployers {
         assertApproxEqRel(int256(loss).toUint256(), 0.01e18, 0.01e18);
     }
 
+    function test_liquidate() public {
+        // Deposit enough collateral to cover the bid
+        vm.prank(ALICE);
+        hook.depositCollateral(key, 100 ether);
+
+        // Deploy fixed 1% fee strategy
+        FixedFeeStrategy strategy = new FixedFeeStrategy(10000);
+
+        // Bid and become strategist. Bid enough to cover 100 blocks
+        vm.prank(ALICE);
+        hook.modifyBid(key, address(strategy), address(0), 100 ether / 100);
+
+        // Skip time forwards by 98 blocks
+        vm.roll(block.number + 98);
+
+        // Liquidate
+        vm.prank(BOB);
+        hook.liquidate(key);
+
+        // Check pool state
+        address strategist;
+        address strategy_;
+        address feeRecipient;
+        uint256 rent;
+        uint256 lastUsurpBlock;
+        (strategist, strategy_, feeRecipient, rent,, lastUsurpBlock,) = hook.pools(key.toId());
+        assertEq(strategist, address(0));
+        assertEq(strategy_, address(0));
+        assertEq(feeRecipient, address(0));
+        assertEq(rent, 0);
+        assertEq(lastUsurpBlock, block.number);
+    }
+
     /// @notice Helper method to do a swap without a slippage limit
     function _swap(PoolKey memory key_, bool zeroForOne, int256 amountSpecified)
         internal

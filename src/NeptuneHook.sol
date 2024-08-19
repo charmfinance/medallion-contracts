@@ -24,9 +24,6 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
  * @author Charm Finance
  * @notice A Uniswap V4 hook that auctions off right to dynamically set and receive all swap fees
  * @dev This code is a proof-of-concept and must not be used in production
- *
- * TODO: Extend IHooks instead of BaseHook?
- * TODO: Implement `liquidate` function to liquidate managers
  */
 contract NeptuneHook is BaseHook {
     // TODO: Clean up unused libraries
@@ -38,6 +35,7 @@ contract NeptuneHook is BaseHook {
     using SafeCast for uint256;
 
     error NotEnoughCollateral();
+    error NotLiquidatable();
     error PoolMustBeDynamicFee();
     error SenderIsAlreadyStrategist();
     error RentTooLow();
@@ -75,6 +73,7 @@ contract NeptuneHook is BaseHook {
     uint256 MIN_USURP_FACTOR = 1.2e18; // 1.2x rent increase to usurp
     uint256 COOLDOWN_BLOCKS = 100; // Cannot decrease bid for 100 blocks after newly becoming manager
     uint256 MIN_COLLATERAL_BLOCKS = 100; // Minimum collateral to withdraw
+    uint256 LIQUIDATION_BLOCKS = 20;
 
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
 
@@ -327,5 +326,23 @@ contract NeptuneHook is BaseHook {
 
     function getDeposit(PoolKey calldata key, address user) external view returns (uint256) {
         return collateral[key.toId()][user];
+    }
+
+    /// @notice Liquidate current strategist if their balance is not sufficient to pay rent
+    function liquidate(PoolKey calldata key) external {
+        // Distribute unpaid rent to LPs
+        poolManager.unlock(abi.encode(CallbackData(key, msg.sender, 0, 0)));
+
+        // Check if strategist is liquidatable
+        PoolState storage pool = pools[key.toId()];
+        if (collateral[key.toId()][pool.strategist] > pool.rent * LIQUIDATION_BLOCKS) {
+            revert NotLiquidatable();
+        }
+
+        pool.strategist = address(0);
+        pool.strategy = address(0);
+        pool.feeRecipient = address(0);
+        pool.rent = 0;
+        pool.lastUsurpBlock = block.number;
     }
 }
