@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: UNLICENSED
-// TODO: Decide on license
 pragma solidity ^0.8.26;
 
 import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
-import {CurrencySettler} from "v4-core/../test/utils/CurrencySettler.sol"; // TODO: Is this the right library to use?
+import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {LPFeeLibrary} from "v4-core/libraries/LPFeeLibrary.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
@@ -22,11 +21,19 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
 /**
  * @title Neptune Hook
  * @author Charm Finance
- * @notice A Uniswap V4 hook that auctions off right to dynamically set and receive all swap fees
+ * @notice A Uniswap V4 hook that auctions off right to set and receive all swap fees
  * @dev This code is a proof-of-concept and must not be used in production
+ *
+ * Todo:
+ * - Find a better way to specify the rent token
+ * - Allow governance to modify parameters like MIN_USURP_FACTOR and COOLDOWN_BLOCKS
+ * - Make sure strategy contract can't see max slippage
+ * - Add support for a maxFee parameter in swap
+ * - Emit events
+ * - Make `_distributeRent` a modifier
+ * - Find way to avoid gas wars when rent is too low and multiple managers bid
  */
 contract NeptuneHook is BaseHook {
-    // TODO: Clean up unused libraries
     using CurrencyLibrary for Currency;
     using CurrencySettler for Currency;
     using LPFeeLibrary for uint24;
@@ -50,7 +57,7 @@ contract NeptuneHook is BaseHook {
         uint256 rent;
         uint256 lastRentPaidBlock;
         uint256 lastUsurpBlock;
-        bool rentInTokenZero; // TODO: Find better way
+        bool rentInTokenZero;
     }
 
     /// @notice Data passed to `PoolManager.unlock` when distributing rent to LPs.
@@ -63,22 +70,20 @@ contract NeptuneHook is BaseHook {
 
     mapping(PoolId => PoolState) public pools;
 
-    /// @notice How much collateral user has deposited into the contract.
+    /// @notice How much collateral user has deposited into the contract. This collateral covers rent payments.
     mapping(PoolId => mapping(address => uint256)) public collateral;
 
-    // Swap fee used when no strategy set
-    // TODO: Think of a better way than having the same fee across all pools
-    uint24 DEFAULT_SWAP_FEE = 3000; // 30 bps swap fee
+    // The default 0.3% swap fee used when no strategy set
+    uint24 DEFAULT_SWAP_FEE = 3000;
 
-    uint256 MIN_USURP_FACTOR = 1.2e18; // 1.2x rent increase to usurp
-    uint256 COOLDOWN_BLOCKS = 100; // Cannot decrease bid for 100 blocks after newly becoming manager
+    uint256 MIN_USURP_FACTOR = 1.2e18; // Rent needs to be 20% higher to usurp current strategist
+    uint256 COOLDOWN_BLOCKS = 100; // Cannot decrease bid for 100 blocks after newly becoming strategist
     uint256 MIN_COLLATERAL_BLOCKS = 100; // Minimum collateral to withdraw
-    uint256 LIQUIDATION_BLOCKS = 20;
+    uint256 LIQUIDATION_BLOCKS = 20; // If strategist's collateral is less than rent * LIQUIDATION_BLOCKS, they can be liquidated
 
     constructor(IPoolManager _poolManager) BaseHook(_poolManager) {}
 
-    /// @notice Specify hook permissions.
-    /// `beforeSwapReturnDelta` is also set to charge custom swap fees that go to the strategist instead of LPs.
+    /// @notice Specify hook permissions. `beforeSwapReturnDelta` is also set to charge custom swap fees that go to the strategist instead of LPs.
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
             beforeInitialize: true,
@@ -98,7 +103,7 @@ contract NeptuneHook is BaseHook {
         });
     }
 
-    /// @notice Ensure dynamic fee flag is set.
+    /// @notice Reverts if dynamic fee flag is not set.
     function beforeInitialize(address, PoolKey calldata key, uint160, bytes calldata)
         external
         view
@@ -108,40 +113,30 @@ contract NeptuneHook is BaseHook {
     {
         // Pool must have dynamic fee flag set. This is so we can override the LP fee in `beforeSwap`.
         if (!key.fee.isDynamicFee()) revert PoolMustBeDynamicFee();
-
-        // Initialize pool state
-        // TODO: Uncomment if we need to actually initialize state
-        // PoolId poolId = key.toId();
-        // pools[poolId] = PoolState({
-        //     strategy: address(0)
-        // });
-
         return this.beforeInitialize.selector;
     }
 
+    /// @notice Distributes rent to LPs before each liquidity change.
     function beforeAddLiquidity(
         address,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata,
         bytes calldata
     ) external override onlyByPoolManager returns (bytes4) {
-        // Distribute unpaid rent to LPs
-        _payRent(key);
+        _distributeRent(key);
         return this.beforeAddLiquidity.selector;
     }
 
-    /// @notice Call strategy to calculate swap fees and redirect the fees to the strategist.
-    // TODO: Add support for `maxFee` parameter specified in swap
+    /// @notice Calculate swap fees from attached strategy and redirect the fees to the strategist.
     function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         external
         override
         onlyByPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        // Distribute unpaid rent to LPs
-        _payRent(key);
+        _distributeRent(key);
 
-        // If no strategy is set, LPs get the default fee like in a hookless Uniswap pool
+        // If no strategy is set, the swap fee is just set to the default fee like in a hookless Uniswap pool
         PoolState storage pool = pools[key.toId()];
         if (address(pool.strategy) == address(0)) {
             return
@@ -149,40 +144,32 @@ contract NeptuneHook is BaseHook {
         }
 
         // Call strategy contract to get swap fee.
-        // TODO: Implement.
         uint128 fee = IStrategy(pool.strategy).calculateSwapFee(key, params);
-
-        // Calculate swap fees. The fees don't go to LPs, they instead go to the `feeRecipient` specified by the strategist.
         int256 fees = params.amountSpecified * uint256(fee).toInt256() / 1e6;
         int256 absFees = fees > 0 ? fees : -fees;
 
-        // Determine the specified currency. If amountSpecified < 0, the swap is exact-in
-        // so the feeCurrency should be the token the swapper is selling.
+        // Determine the specified currency. If amountSpecified < 0, the swap is exact-in so the feeCurrency should be the token the swapper is selling.
         // If amountSpecified > 0, the swap is exact-out and it's the bought token.
         bool exactOut = params.amountSpecified > 0;
         Currency feeCurrency = exactOut != params.zeroForOne ? key.currency0 : key.currency1;
 
         // Send fees to `feeRecipient`
-        // TODO: Support both claim and erc20 transfer?
-        take(feeCurrency, poolManager, pool.feeRecipient, absFees.toUint256(), true);
+        feeCurrency.take(poolManager, pool.feeRecipient, absFees.toUint256(), true);
 
         // Override LP fee to zero
         return (this.beforeSwap.selector, toBeforeSwapDelta(absFees.toInt128(), 0), LPFeeLibrary.OVERRIDE_FEE_FLAG);
     }
 
-    /// @notice Deposit tokens into this contract. Deposits are used to cover rent payments
-    /// as the manager.
-    // TODO: Emit event
+    /// @notice Deposit tokens into this contract. Deposits are used to cover rent payments as the manager.
     function depositCollateral(PoolKey calldata key, uint256 amount) external {
-        // Deposit 6909 claim tokens to Uniswap V4 PoolManager
+        // Deposit 6909 claim tokens to Uniswap V4 PoolManager. The claim tokens are owned by this contract.
         poolManager.unlock(abi.encode(CallbackData(key, msg.sender, amount, 0)));
-
         collateral[key.toId()][msg.sender] += amount;
     }
 
-    /// @notice Withdraw tokens from this contract that were previously deposited with `deposit`.
-    // TODO: Emit event
+    /// @notice Withdraw tokens from this contract that were previously deposited with `depositCollateral`.
     function withdrawCollateral(PoolKey calldata key, uint256 amount) external {
+        _distributeRent(key);
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
 
@@ -202,8 +189,6 @@ contract NeptuneHook is BaseHook {
     }
 
     /// @notice Modify bid or usurp the current strategist of a pool by paying a higher rent
-    // TODO: Figure out a way to avoid gas wars when multiple managers want to usurp when rent is low
-    // TODO: Emit event
     function modifyBid(PoolKey calldata key, address strategy, address feeRecipient, uint256 rent) external {
         // Distribute unpaid rent to LPs
         poolManager.unlock(abi.encode(CallbackData(key, msg.sender, 0, 0)));
@@ -211,6 +196,7 @@ contract NeptuneHook is BaseHook {
         PoolId poolId = key.toId();
         PoolState storage pool = pools[poolId];
 
+        // Revert if sender has not deposited enough collateral
         uint256 minCollateral = rent * MIN_COLLATERAL_BLOCKS;
         if (collateral[poolId][msg.sender] < minCollateral) {
             revert NotEnoughCollateral();
@@ -237,7 +223,7 @@ contract NeptuneHook is BaseHook {
         pool.rent = rent;
     }
 
-    // TODO: Check don't need onlyByPoolManager modifier
+    /// @notice Deposit or withdraw 6909 claim tokens and distribute rent to LPs.
     function _unlockCallback(bytes calldata rawData) internal override returns (bytes memory) {
         CallbackData memory data = abi.decode(rawData, (CallbackData));
 
@@ -245,23 +231,23 @@ contract NeptuneHook is BaseHook {
             PoolId poolId = data.key.toId();
             PoolState storage pool = pools[poolId];
             Currency currency = pool.rentInTokenZero ? data.key.currency0 : data.key.currency1;
-            take(currency, poolManager, address(this), data.depositAmount, true); // Mint 6909
-            settle(currency, poolManager, data.sender, data.depositAmount, false); // Transfer ERC20
+            currency.take(poolManager, address(this), data.depositAmount, true); // Mint 6909
+            currency.settle(poolManager, data.sender, data.depositAmount, false); // Transfer ERC20
         }
         if (data.withdrawAmount > 0) {
             PoolId poolId = data.key.toId();
             PoolState storage pool = pools[poolId];
             Currency currency = pool.rentInTokenZero ? data.key.currency0 : data.key.currency1;
-            settle(currency, poolManager, address(this), data.withdrawAmount, true); // Burn 6909
-            take(currency, poolManager, data.sender, data.withdrawAmount, false); // Claim ERC20
+            currency.settle(poolManager, address(this), data.withdrawAmount, true); // Burn 6909
+            currency.take(poolManager, data.sender, data.withdrawAmount, false); // Claim ERC20
         }
 
-        _payRent(data.key);
+        _distributeRent(data.key);
         return "";
     }
 
-    // TODO: Emit event
-    function _payRent(PoolKey memory key) internal {
+    /// @dev Must be called while lock is acquired.
+    function _distributeRent(PoolKey memory key) internal {
         PoolState storage pool = pools[key.toId()];
         uint256 rentAmount = pool.rent * (block.number - pool.lastRentPaidBlock);
         pool.lastRentPaidBlock = block.number;
@@ -285,62 +271,26 @@ contract NeptuneHook is BaseHook {
         // TODO: ensure there is liquidity when donating
         poolManager.donate(key, amount0, amount1, "");
 
-        // If strategist doesn't have enough collateral to pay rent and wasn't liquidated
-        // in time, remove them as strategist
+        // If strategist doesn't have enough collateral to pay rent and wasn't liquidated in time, remove them as strategist
         if (isLiquidate) {
-            _resetStrategist(key);
+            _removeStrategist(key);
         }
     }
 
     /// @notice Calls `settle` or `take` depending on the signs of `delta0` and `delta1`
     function _settleOrTake(PoolKey memory key, address user, int256 delta0, int256 delta1, bool useClaims) internal {
-        if (delta0 < 0) settle(key.currency0, poolManager, user, uint256(-delta0), useClaims);
-        if (delta1 < 0) settle(key.currency1, poolManager, user, uint256(-delta1), useClaims);
-        if (delta0 > 0) take(key.currency0, poolManager, user, uint256(delta0), useClaims);
-        if (delta1 > 0) take(key.currency1, poolManager, user, uint256(delta1), useClaims);
+        if (delta0 < 0) key.currency0.settle(poolManager, user, uint256(-delta0), useClaims);
+        if (delta1 < 0) key.currency1.settle(poolManager, user, uint256(-delta1), useClaims);
+        if (delta0 > 0) key.currency0.take(poolManager, user, uint256(delta0), useClaims);
+        if (delta1 > 0) key.currency1.take(poolManager, user, uint256(delta1), useClaims);
     }
 
-    /// @notice Settle (pay) a currency to the PoolManager
-    /// @dev From https://github.com/Uniswap/v4-core/blob/main/test/utils/CurrencySettler.sol
-    /// @param currency Currency to settle
-    /// @param manager IPoolManager to settle to
-    /// @param payer Address of the payer, the token sender
-    /// @param amount Amount to send
-    /// @param burn If true, burn the ERC-6909 token, otherwise ERC20-transfer to the PoolManager
-    function settle(Currency currency, IPoolManager manager, address payer, uint256 amount, bool burn) internal {
-        // for native currencies or burns, calling sync is not required
-        // short circuit for ERC-6909 burns to support ERC-6909-wrapped native tokens
-        if (burn) {
-            manager.burn(payer, currency.toId(), amount);
-        } else if (currency.isNative()) {
-            manager.settle{value: amount}();
-        } else {
-            manager.sync(currency);
-            if (payer != address(this)) {
-                IERC20Minimal(Currency.unwrap(currency)).transferFrom(payer, address(manager), amount);
-            } else {
-                IERC20Minimal(Currency.unwrap(currency)).transfer(address(manager), amount);
-            }
-            manager.settle();
-        }
-    }
-
-    /// @notice Take (receive) a currency from the PoolManager
-    /// @dev From https://github.com/Uniswap/v4-core/blob/main/test/utils/CurrencySettler.sol
-    /// @param currency Currency to take
-    /// @param manager IPoolManager to take from
-    /// @param recipient Address of the recipient, the token receiver
-    /// @param amount Amount to receive
-    /// @param claims If true, mint the ERC-6909 token, otherwise ERC20-transfer from the PoolManager to recipient
-    function take(Currency currency, IPoolManager manager, address recipient, uint256 amount, bool claims) internal {
-        claims ? manager.mint(recipient, currency.toId(), amount) : manager.take(currency, recipient, amount);
-    }
-
+    /// @notice Get the collateral deposited by `user` for pool `key`.
     function getDeposit(PoolKey calldata key, address user) external view returns (uint256) {
         return collateral[key.toId()][user];
     }
 
-    /// @notice Liquidate current strategist if their balance is not sufficient to pay rent
+    /// @notice Liquidate current strategist if their balance is not sufficient to pay rent. Can be called by anyone.
     function liquidate(PoolKey calldata key) external {
         // Distribute unpaid rent to LPs
         poolManager.unlock(abi.encode(CallbackData(key, msg.sender, 0, 0)));
@@ -350,10 +300,11 @@ contract NeptuneHook is BaseHook {
         if (collateral[key.toId()][pool.strategist] > pool.rent * LIQUIDATION_BLOCKS) {
             revert NotLiquidatable();
         }
-        _resetStrategist(key);
+        _removeStrategist(key);
     }
 
-    function _resetStrategist(PoolKey memory key) internal {
+    /// @notice Reset strategist and strategy for a pool if they are liquidated.
+    function _removeStrategist(PoolKey memory key) internal {
         PoolState storage pool = pools[key.toId()];
         pool.strategist = address(0);
         pool.strategy = address(0);

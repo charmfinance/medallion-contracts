@@ -21,24 +21,17 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {FixedFeeStrategy} from "../src/strategies/FixedFeeStrategy.sol";
 
-/**
- * TODO: Add test for swap when no strategy attached
- */
+
 contract TestNeptuneHook is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using SafeCast for int256;
 
-    // Addresses for pranking
     address constant ALICE = address(0x1001);
     address constant BOB = address(0x1002);
 
     int24 constant TICK_SPACING = 60;
-
-    // @notice Default initialization parameters with tick range of -60 to 60 and 1% fee
     bytes constant INIT_PARAMS = "";
-    // bytes constant INIT_PARAMS =
-    //     abi.encode(NeptuneHook.InitializeParams({tickLower: -60, tickUpper: 60, lpFee: 10_000, payInTokenZero: true}));
 
     NeptuneHook public hook;
 
