@@ -1,1 +1,1 @@
-# neptune-contracts
+# medallion-contracts

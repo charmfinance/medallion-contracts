@@ -9,13 +9,13 @@ import {IStrategy} from "../interfaces/IStrategy.sol";
 contract DirectionalFeeStrategy is IStrategy {
     using PoolIdLibrary for PoolKey;
 
-    address public neptuneHook;
+    address public medallionHook;
     uint128 public feeIfSameDirection;
     uint128 public feeIfChangeDirection;
     mapping(PoolId => bool) public lastDirection;
 
-    constructor(address _neptuneHook, uint128 _feeIfSameDirection, uint128 _feeIfChangeDirection) {
-        neptuneHook = _neptuneHook;
+    constructor(address _medallionHook, uint128 _feeIfSameDirection, uint128 _feeIfChangeDirection) {
+        medallionHook = _medallionHook;
         feeIfSameDirection = _feeIfSameDirection;
         feeIfChangeDirection = _feeIfChangeDirection;
     }
@@ -25,8 +25,8 @@ contract DirectionalFeeStrategy is IStrategy {
         override
         returns (uint128 fee)
     {
-        // Only Neptune can call this function otherwise anyone can mutate this contract's state
-        require(msg.sender == neptuneHook, "!neptuneHook");
+        // Only Medallion can call this function otherwise anyone can mutate this contract's state
+        require(msg.sender == medallionHook, "medallionHook");
 
         PoolId poolId = key.toId();
         fee = lastDirection[poolId] == swapParams.zeroForOne ? feeIfSameDirection : feeIfChangeDirection;

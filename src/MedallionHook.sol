@@ -19,7 +19,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IStrategy} from "./interfaces/IStrategy.sol";
 
 /**
- * @title Neptune Hook
+ * @title Medallion Hook
  * @author Charm Finance
  * @notice A Uniswap V4 hook that auctions off right to set and receive all swap fees
  * @dev This code is a proof-of-concept and must not be used in production
@@ -33,7 +33,7 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
  * - Make `_distributeRent` a modifier
  * - Find way to avoid gas wars when rent is too low and multiple managers bid
  */
-contract NeptuneHook is BaseHook {
+contract MedallionHook is BaseHook {
     using CurrencyLibrary for Currency;
     using CurrencySettler for Currency;
     using LPFeeLibrary for uint24;

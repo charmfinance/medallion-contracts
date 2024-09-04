@@ -4,7 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 import "forge-std/console2.sol";
 
-import {NeptuneHook} from "../src/NeptuneHook.sol";
+import {MedallionHook} from "../src/MedallionHook.sol";
 import {BalanceDelta, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {CurrencyLibrary, Currency} from "v4-core/types/Currency.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
@@ -21,8 +21,7 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {FixedFeeStrategy} from "../src/strategies/FixedFeeStrategy.sol";
 
-
-contract TestNeptuneHook is Test, Deployers {
+contract TestMedallionHook is Test, Deployers {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using SafeCast for int256;
@@ -33,7 +32,7 @@ contract TestNeptuneHook is Test, Deployers {
     int24 constant TICK_SPACING = 60;
     bytes constant INIT_PARAMS = "";
 
-    NeptuneHook public hook;
+    MedallionHook public hook;
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -46,8 +45,8 @@ contract TestNeptuneHook is Test, Deployers {
                     | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG
             )
         );
-        deployCodeTo("NeptuneHook.sol", abi.encode(manager), hookAddress);
-        hook = NeptuneHook(hookAddress);
+        deployCodeTo("MedallionHook.sol", abi.encode(manager), hookAddress);
+        hook = MedallionHook(hookAddress);
 
         // Also approve hook to spend our tokens
         IERC20(Currency.unwrap(currency0)).approve(hookAddress, type(uint256).max);
@@ -85,7 +84,7 @@ contract TestNeptuneHook is Test, Deployers {
         // The error should be `FailedHookCall` with the revertReason parameter set to `PoolMustBeDynamicFee`
         vm.expectRevert(
             abi.encodeWithSelector(
-                Hooks.FailedHookCall.selector, abi.encodeWithSelector(NeptuneHook.PoolMustBeDynamicFee.selector)
+                Hooks.FailedHookCall.selector, abi.encodeWithSelector(MedallionHook.PoolMustBeDynamicFee.selector)
             )
         );
         manager.initialize(badKey, SQRT_PRICE_1_1, INIT_PARAMS);
@@ -173,7 +172,7 @@ contract TestNeptuneHook is Test, Deployers {
         hook.depositCollateral(key, 1000);
 
         // Should fail because user doesn't have enough collateral
-        vm.expectRevert(abi.encodeWithSelector(NeptuneHook.NotEnoughCollateral.selector));
+        vm.expectRevert(abi.encodeWithSelector(MedallionHook.NotEnoughCollateral.selector));
         vm.prank(BOB);
         hook.modifyBid(key, address(0), address(0), 12345);
     }
@@ -190,7 +189,7 @@ contract TestNeptuneHook is Test, Deployers {
         hook.modifyBid(key, address(0), address(0), 1000);
 
         // Should fail because rent is too low. It should be higher than current rent plus buffer
-        vm.expectRevert(abi.encodeWithSelector(NeptuneHook.RentTooLow.selector));
+        vm.expectRevert(abi.encodeWithSelector(MedallionHook.RentTooLow.selector));
         vm.prank(BOB);
         hook.modifyBid(key, address(0), address(0), 1001);
     }
@@ -303,7 +302,7 @@ contract TestNeptuneHook is Test, Deployers {
 
         // Bid and become strategist. Collateral can cover 10 blocks.
         vm.prank(ALICE);
-        vm.expectRevert(abi.encodeWithSelector(NeptuneHook.NotEnoughCollateral.selector));
+        vm.expectRevert(abi.encodeWithSelector(MedallionHook.NotEnoughCollateral.selector));
         hook.modifyBid(key, address(strategy), address(0), 100 ether / 10);
     }
 
