@@ -21,7 +21,7 @@ import {IStrategy} from "./interfaces/IStrategy.sol";
 /**
  * @title Medallion Hook
  * @author Charm Finance
- * @notice A Uniswap V4 hook that auctions off right to set and receive all swap fees
+ * @notice A Uniswap V4 hook that auctions off the right to set and receive all swap fees
  * @dev This code is a proof-of-concept and must not be used in production
  *
  * Todo:
