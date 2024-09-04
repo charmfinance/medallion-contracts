@@ -39,11 +39,12 @@ contract AmountDependentStrategy is IStrategy {
         medallionHook = _medallionHook;
     }
 
-    function calculateSwapFee(PoolKey calldata key, IPoolManager.SwapParams calldata swapParams)
-        external
-        override
-        returns (uint128)
-    {
+    function calculateSwapFee(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata swapParams,
+        bytes calldata
+    ) external override returns (uint128) {
         PoolId poolId = key.toId();
 
         // If the fee multiplier is not set, use the default fee

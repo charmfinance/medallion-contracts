@@ -14,7 +14,7 @@ contract FixedFeeStrategy is IStrategy {
         fee = _fee;
     }
 
-    function calculateSwapFee(PoolKey calldata, IPoolManager.SwapParams calldata)
+    function calculateSwapFee(address, PoolKey calldata, IPoolManager.SwapParams calldata, bytes calldata)
         external
         view
         override

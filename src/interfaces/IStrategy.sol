@@ -5,7 +5,10 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 
 interface IStrategy {
-    function calculateSwapFee(PoolKey calldata key, IPoolManager.SwapParams calldata params)
-        external
-        returns (uint128);
+    function calculateSwapFee(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata hookData
+    ) external returns (uint128);
 }

@@ -128,12 +128,12 @@ contract MedallionHook is BaseHook {
     }
 
     /// @notice Calculate swap fees from attached strategy and redirect the fees to the strategist.
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
-        external
-        override
-        onlyByPoolManager
-        returns (bytes4, BeforeSwapDelta, uint24)
-    {
+    function beforeSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        bytes calldata hookData
+    ) external override onlyByPoolManager returns (bytes4, BeforeSwapDelta, uint24) {
         _distributeRent(key);
 
         // If no strategy is set, the swap fee is just set to the default fee like in a hookless Uniswap pool
@@ -144,7 +144,7 @@ contract MedallionHook is BaseHook {
         }
 
         // Call strategy contract to get swap fee.
-        uint128 fee = IStrategy(pool.strategy).calculateSwapFee(key, params);
+        uint128 fee = IStrategy(pool.strategy).calculateSwapFee(sender, key, params, hookData);
         int256 fees = params.amountSpecified * uint256(fee).toInt256() / 1e6;
         int256 absFees = fees > 0 ? fees : -fees;
 

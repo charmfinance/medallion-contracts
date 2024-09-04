@@ -20,11 +20,12 @@ contract DirectionalFeeStrategy is IStrategy {
         feeIfChangeDirection = _feeIfChangeDirection;
     }
 
-    function calculateSwapFee(PoolKey calldata key, IPoolManager.SwapParams calldata swapParams)
-        external
-        override
-        returns (uint128 fee)
-    {
+    function calculateSwapFee(
+        address,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata swapParams,
+        bytes calldata
+    ) external override returns (uint128 fee) {
         // Only Medallion can call this function otherwise anyone can mutate this contract's state
         require(msg.sender == medallionHook, "medallionHook");
 
